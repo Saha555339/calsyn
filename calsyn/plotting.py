@@ -56,6 +56,7 @@ def plot_coverage(
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
     ax.legend(loc="upper left")
 
     return ax
@@ -100,6 +101,7 @@ def plot_correlation_comparison(
     ax.set_xticklabels(feature_names, rotation=45, ha="right")
     ax.set_ylabel("Correlation with target")
     ax.set_title("Feature correlations: real vs synthetic")
+    ax.grid(True, axis="y", alpha=0.3)
     ax.legend()
     ax.axhline(0, color="grey", linewidth=0.5)
 
