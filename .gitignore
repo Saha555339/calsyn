@@ -1,0 +1,50 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+**/.pytest_cache/
+.cache/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# Project-specific generated files
+catboost_info/
+**/catboost_info/
+
+# Ruff / linters / type checkers
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.pyre/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
