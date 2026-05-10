@@ -6,6 +6,17 @@ calibrated on real data.
 """
 
 from calsyn._version import __version__
-from calsyn.generator import CalibratedGenerator, GenerationResult, DiagnosticReport
+from calsyn.generator import (
+    CalibratedGenerator,
+    GenerationResult,
+    DiagnosticReport,
+    FeatureNoiseResult,
+)
 
-__all__ = ["CalibratedGenerator", "GenerationResult", "DiagnosticReport", "__version__"]
+__all__ = [
+    "CalibratedGenerator",
+    "GenerationResult",
+    "DiagnosticReport",
+    "FeatureNoiseResult",
+    "__version__",
+]

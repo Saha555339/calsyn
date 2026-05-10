@@ -20,11 +20,11 @@ class NoiseModel:
         - "auto"   — fit both normal and t to residuals, pick by BIC.
         - "normal" — fit N(0, σ²).
         - "t"      — fit scaled Student-t (df, loc, scale).
-    random_seed : int
-        Seed for sampling.
+    random_seed : int or None
+        Seed for sampling. None means a new random seed each call.
     """
 
-    def __init__(self, kind: NoiseKind = "auto", random_seed: int = 42) -> None:
+    def __init__(self, kind: NoiseKind = "auto", random_seed: int | None = None) -> None:
         self.kind = kind
         self.random_seed = random_seed
         self.dist_name_: str | None = None
@@ -54,6 +54,23 @@ class NoiseModel:
             raise ValueError(f"Unknown noise kind: {self.kind!r}")
         return self
 
+    def set_scale(self, scale: float) -> None:
+        """Override the fitted noise scale without re-fitting.
+
+        Parameters
+        ----------
+        scale : float
+            New scale parameter for the distribution.
+        """
+        if self._frozen is None:
+            raise RuntimeError("Call .fit() first.")
+        scale = float(scale)
+        self.params_["scale"] = scale
+        if self.dist_name_ == "normal":
+            self._frozen = stats.norm(loc=self.params_["loc"], scale=scale)
+        elif self.dist_name_ == "t":
+            self._frozen = stats.t(df=self.params_["df"], loc=self.params_["loc"], scale=scale)
+
     def sample(self, size: int | tuple[int, ...]) -> NDArray:
         """Sample noise values.
 
@@ -74,7 +91,6 @@ class NoiseModel:
         """Sample with an external Generator (for per-trajectory seeds)."""
         if self._frozen is None:
             raise RuntimeError("Call .fit() before .sample_rng().")
-        # scipy frozen distributions accept numpy Generator
         return self._frozen.rvs(size=size, random_state=rng)
 
     # ---- internals ----

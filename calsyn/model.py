@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from catboost import CatBoostRegressor
 from numpy.typing import NDArray
 
@@ -17,32 +17,31 @@ def _default_catboost_params() -> dict[str, Any]:
         "depth": 6,
         "loss_function": "RMSE",
         "verbose": 0,
-        "random_seed": 42,
     }
 
 
 STRAT_FREQ = {
-    "M": "M",       # month
-    "d": "D",       # day
-    "m": "min",     # minute
-    "h": "h",       # hour
-    "W": "W",       # week
+    "M": "1mo",  # month
+    "d": "1d",   # day
+    "m": "1m",   # minute
+    "h": "1h",   # hour
+    "W": "1w",   # week
 }
 
 
 def stratified_time_split(
-    dates: pd.Series,
+    dates: pl.Series,
     val_fraction: float,
-    random_seed: int,
+    random_seed: int | None,
     strat_freq: str = "M",
 ) -> tuple[NDArray, NDArray]:
     """Split indices so that val_fraction of each time period goes to OOS.
 
     Parameters
     ----------
-    dates : pd.Series of datetime-like
+    dates : pl.Series of Date or Datetime
     val_fraction : float in (0, 1)
-    random_seed : int
+    random_seed : int or None
     strat_freq : str
         Stratification period: "M" (month), "d" (day), "m" (minute),
         "h" (hour), "W" (week).
@@ -55,14 +54,17 @@ def stratified_time_split(
         raise ValueError(
             f"Unknown strat_freq={strat_freq!r}. Choose from {list(STRAT_FREQ.keys())}."
         )
-    pd_freq = STRAT_FREQ[strat_freq]
+    pl_freq = STRAT_FREQ[strat_freq]
 
     rng = np.random.default_rng(random_seed)
-    periods = dates.dt.to_period(pd_freq)
-    train_parts, val_parts = [], []
 
-    for _, group_idx in dates.groupby(periods).groups.items():
-        idx = np.array(group_idx)
+    # Truncate to period; convert to numpy for grouping (works with any temporal dtype)
+    periods_arr = dates.dt.truncate(pl_freq).to_numpy()
+    unique_periods, period_labels = np.unique(periods_arr, return_inverse=True)
+
+    train_parts, val_parts = [], []
+    for group_id in range(len(unique_periods)):
+        idx = np.where(period_labels == group_id)[0]
         rng.shuffle(idx)
         n_val = int(len(idx) * val_fraction)
         if n_val == 0 or len(idx) < 2:
@@ -121,8 +123,8 @@ class CalibrationModel:
         "h" (hour), "W" (week).
     catboost_params : dict or None
         Custom CatBoost parameters (ignored when auto_tune=True).
-    random_seed : int
-        Random seed.
+    random_seed : int or None
+        Random seed. None means a new random seed each run.
     """
 
     def __init__(
@@ -133,7 +135,7 @@ class CalibrationModel:
         val_fraction: float = 0.1,
         strat_freq: str = "M",
         catboost_params: dict[str, Any] | None = None,
-        random_seed: int = 42,
+        random_seed: int | None = None,
     ) -> None:
         self.date_col = date_col
         self.auto_tune = auto_tune
@@ -159,16 +161,22 @@ class CalibrationModel:
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
         return {"r2": r2, "rmse": rmse, "bias": bias}
 
-    def _feature_matrix(self, X: pd.DataFrame) -> NDArray:
+    def _feature_matrix(self, X: pl.DataFrame) -> NDArray:
         """Drop date column and return numeric array."""
-        return X.drop(columns=[self.date_col]).values.astype(np.float64)
+        return X.drop(self.date_col).to_numpy().astype(np.float64)
 
-    def fit(self, X: pd.DataFrame, y: NDArray) -> "CalibrationModel":
+    def _catboost_seed(self) -> int:
+        """Return a concrete int seed for CatBoost (generates one if random_seed is None)."""
+        if self.random_seed is not None:
+            return self.random_seed
+        return int(np.random.randint(0, 2 ** 31))
+
+    def fit(self, X: pl.DataFrame, y: NDArray) -> "CalibrationModel":
         """Fit on train split, compute OOS metrics on val split.
 
         Parameters
         ----------
-        X : pd.DataFrame with date_col and numeric feature columns
+        X : pl.DataFrame with date_col (Date or Datetime) and numeric feature columns
         y : array of shape (n_samples,)
 
         Returns
@@ -176,11 +184,11 @@ class CalibrationModel:
         self
         """
         y = np.asarray(y, dtype=np.float64)
-        dates = pd.to_datetime(X[self.date_col])
+        dates = X[self.date_col]
 
         if not 0 < self.val_fraction < 1:
             raise ValueError("val_fraction must be in (0, 1).")
-        
+
         train_idx, val_idx = stratified_time_split(
             dates, self.val_fraction, self.random_seed, self.strat_freq
         )
@@ -199,33 +207,32 @@ class CalibrationModel:
         X_train, y_train = X_numeric[train_idx], y[train_idx]
         X_val, y_val = X_numeric[val_idx], y[val_idx]
 
-        # resolve params (optuna uses train/val split)
+        cb_seed = self._catboost_seed()
+
         if self.auto_tune:
-            self.best_params_ = self._tune(X_train, y_train, X_val, y_val)
-            params = {**self.best_params_, "verbose": 0, "random_seed": self.random_seed}
+            self.best_params_ = self._tune(X_train, y_train, X_val, y_val, cb_seed)
+            params = {**self.best_params_, "verbose": 0, "random_seed": cb_seed}
         else:
-            params = {**self.catboost_params, "random_seed": self.random_seed}
+            params = {**self.catboost_params, "random_seed": cb_seed}
             self.best_params_ = params
 
-        # fit only on train
         self.model_ = CatBoostRegressor(**params)
         self.model_.fit(X_train, y_train)
 
-        # OOS metrics
         oos_preds = self.model_.predict(X_val)
         self.oos_metrics_ = self._compute_metrics(y_val, oos_preds)
 
         return self
 
-    def predict(self, X: pd.DataFrame | NDArray) -> NDArray:
+    def predict(self, X: pl.DataFrame | NDArray) -> NDArray:
         """Predict f(X)."""
         if self.model_ is None:
             raise RuntimeError("Call .fit() before .predict().")
-        if isinstance(X, pd.DataFrame):
+        if isinstance(X, pl.DataFrame):
             X = self._feature_matrix(X)
         return self.model_.predict(np.asarray(X, dtype=np.float64))
 
-    def residuals(self, X: pd.DataFrame, y: NDArray) -> NDArray:
+    def residuals(self, X: pl.DataFrame, y: NDArray) -> NDArray:
         """Compute residuals on train split: y_train - f(X_train)."""
         y = np.asarray(y, dtype=np.float64)
         X_numeric = self._feature_matrix(X)
@@ -234,7 +241,12 @@ class CalibrationModel:
         return y[idx] - preds
 
     def _tune(
-        self, X_train: NDArray, y_train: NDArray, X_val: NDArray, y_val: NDArray
+        self,
+        X_train: NDArray,
+        y_train: NDArray,
+        X_val: NDArray,
+        y_val: NDArray,
+        cb_seed: int,
     ) -> dict[str, Any]:
         import optuna
 
@@ -242,7 +254,7 @@ class CalibrationModel:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study.optimize(
             lambda trial: _optuna_objective(
-                trial, X_train, y_train, X_val, y_val, self.random_seed
+                trial, X_train, y_train, X_val, y_val, cb_seed
             ),
             n_trials=self.n_trials,
         )

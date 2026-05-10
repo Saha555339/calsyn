@@ -28,10 +28,10 @@ pip install "calsyn[tune]"
 ## Quick Start
 
 ```python
-import pandas as pd
+import polars as pl
 from calsyn import CalibratedGenerator
 
-# X is a DataFrame with a date column and numeric features
+# X is a Polars DataFrame with a date column and numeric features
 # y is the target variable (e.g. log-returns)
 
 gen = CalibratedGenerator(date_col="date", noise="auto")
@@ -44,18 +44,22 @@ result.simulations.shape  # (500, n_samples)
 
 ## Input Format
 
-`X` must be a `pd.DataFrame` with:
-- a datetime column (name passed via `date_col`)
+`X` must be a `pl.DataFrame` with:
+- a date/datetime column (name passed via `date_col`)
 - numeric feature columns
 
 ```python
-X = pd.DataFrame({
-    "date": pd.date_range("2023-01-01", periods=500, freq="B"),
+from datetime import date, timedelta
+import polars as pl
+
+start = date(2023, 1, 1)
+X = pl.DataFrame({
+    "date": [start + timedelta(days=i) for i in range(500)],
     "GAZP": gazp_log_returns,
     "LKOH": lkoh_log_returns,
     "USDRUB": usdrub_log_returns,
 })
-y = sber_log_returns  # target
+y = sber_log_returns  # target (numpy array)
 ```
 
 ## Treatment Modes
@@ -93,6 +97,46 @@ result = gen.generate(
     n_simulations=500,
 )
 ```
+
+## Feature Noise Simulation
+
+A separate mode for sensitivity analysis: study how noise in individual features propagates to Y.
+
+```
+Y_sim = f(X̃) + ε_Y
+X̃[j] = X[j] + ε_X[j]   for j in feature_noise
+X̃[j] = X[j]             otherwise
+```
+
+The model `f` is **not** re-trained — user-specified noise is injected into the features directly. This is independent of treatment effects; do not mix with `generate()`.
+
+```python
+result = gen.generate_with_feature_noise(
+    X,
+    feature_noise={
+        "USDRUB": {"distribution": "normal", "scale": 0.01},
+        "OIL":    {"distribution": "t", "scale": 0.02, "df": 4},
+    },
+    n_simulations=500,
+)
+
+result.simulations.shape              # (500, n_samples) — Y trajectories
+result.X_simulations["USDRUB"].shape  # (500, n_samples) — noisy feature values
+result.f_X_mean                       # f(X) on original features, for comparison
+```
+
+### `feature_noise` spec
+
+Each entry maps a feature name to a noise spec dict:
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `distribution` | yes | `"normal"` or `"t"` |
+| `scale` | yes | Std dev (normal) or scale parameter (t) |
+| `loc` | no (default 0) | Location shift |
+| `df` | yes for `"t"` | Degrees of freedom |
+
+`X_simulations` contains only the noised features — un-noised features remain in the original `X`.
 
 ## Validation
 
@@ -143,6 +187,30 @@ print(gen.noise_params)
 # {'distribution': 't', 'df': 4.2, 'loc': 0.001, 'scale': 0.012}
 ```
 
+### Overriding the noise scale
+
+When residual variance is unreliable (e.g. low data variability or poor model fit), you can set the noise scale directly instead of relying on the fitted residuals:
+
+```python
+gen = CalibratedGenerator(date_col="date", noise="normal", noise_scale=0.05)
+gen.fit(X, y)
+
+print(gen.noise_params)
+# {'distribution': 'normal', 'loc': ..., 'scale': 0.05}
+```
+
+## Random Seed
+
+By default `random_seed=None`, so simulation outputs vary between runs — which is the correct behavior for Monte Carlo. Pass an integer to fix the seed for reproducibility:
+
+```python
+# reproducible
+gen = CalibratedGenerator(date_col="date", random_seed=42)
+
+# stochastic (default) — different trajectories each time
+gen = CalibratedGenerator(date_col="date")
+```
+
 ## Diagnostics
 
 ```python
@@ -185,14 +253,15 @@ gen.fit(X, y)
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `date_col` | `str` | `"date"` | Name of datetime column in X |
+| `date_col` | `str` | `"date"` | Name of date/datetime column in X |
 | `noise` | `"auto" \| "normal" \| "t"` | `"auto"` | Noise distribution |
+| `noise_scale` | `float \| None` | `None` | Override fitted noise scale |
 | `auto_tune` | `bool` | `False` | Optuna hyperparameter search |
 | `n_trials` | `int` | `50` | Optuna trials |
 | `val_fraction` | `float` | `0.1` | OOS fraction per time period |
 | `strat_freq` | `str` | `"M"` | Stratification: "M", "W", "d", "h", "m" |
 | `catboost_params` | `dict \| None` | `None` | Custom CatBoost params |
-| `random_seed` | `int` | `42` | Random seed |
+| `random_seed` | `int \| None` | `None` | Random seed (None = varies between runs) |
 
 **Methods:**
 
