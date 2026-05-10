@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from numpy.typing import NDArray
 
 from calsyn.diagnostics import (
@@ -52,6 +52,65 @@ class DiagnosticReport:
     oos_metrics: dict[str, float]
 
 
+@dataclass
+class FeatureNoiseResult:
+    """Container for feature-noise generation output.
+
+    Attributes
+    ----------
+    simulations : array of shape (n_simulations, n_samples)
+        Synthetic Y trajectories: f(X̃) + ε_Y.
+    X_simulations : dict[str, array of shape (n_simulations, n_samples)]
+        Noisy feature values X̃[j] = X[j] + ε_X[j] for each noised feature.
+        Only features listed in ``feature_noise`` are included.
+    f_X_mean : array of shape (n_samples,)
+        Model predictions f(X) on the original (un-noised) features, for reference.
+    """
+
+    simulations: NDArray
+    X_simulations: dict[str, NDArray]
+    f_X_mean: NDArray
+
+
+def _sample_feature_noise(
+    spec: dict, size: tuple, rng: np.random.Generator
+) -> NDArray:
+    """Sample additive noise for a single feature according to ``spec``.
+
+    Parameters
+    ----------
+    spec : dict
+        Keys: ``distribution`` ("normal" or "t"), ``scale`` (float),
+        ``loc`` (float, optional, default 0), ``df`` (float, required for "t").
+    size : tuple of ints
+        Output shape.
+    rng : numpy Generator
+
+    Returns
+    -------
+    NDArray of given shape
+    """
+    dist = spec.get("distribution")
+    loc = float(spec.get("loc", 0.0))
+    scale = float(spec["scale"])
+
+    if dist == "normal":
+        if scale == 0.0:
+            return np.zeros(size) if loc == 0.0 else np.full(size, loc)
+        return rng.normal(loc=loc, scale=scale, size=size)
+    elif dist == "t":
+        if "df" not in spec:
+            raise ValueError("'df' is required for 't' distribution.")
+        df = float(spec["df"])
+        if scale == 0.0:
+            return np.zeros(size) if loc == 0.0 else np.full(size, loc)
+        return loc + scale * rng.standard_t(df=df, size=size)
+    else:
+        raise ValueError(
+            f"Unknown distribution {dist!r}. Supported: 'normal', 't'."
+        )
+
+
 class CalibratedGenerator:
     """Calibrated synthetic data generator.
 
@@ -64,9 +123,12 @@ class CalibratedGenerator:
     Parameters
     ----------
     date_col : str
-        Name of the datetime column in X.
+        Name of the date/datetime column in X.
     noise : {"auto", "normal", "t"}
         Noise distribution type.
+    noise_scale : float or None
+        If provided, overrides the fitted noise scale after fitting.
+        Useful when residual variance is unreliable (e.g. low data variability).
     auto_tune : bool
         If True, use Optuna to tune CatBoost hyperparameters.
     n_trials : int
@@ -78,8 +140,8 @@ class CalibratedGenerator:
         "m" (minute), "h" (hour), "W" (week).
     catboost_params : dict or None
         Custom CatBoost parameters (ignored when auto_tune=True).
-    random_seed : int
-        Global random seed.
+    random_seed : int or None
+        Global random seed. None (default) means outputs vary between runs.
 
     Examples
     --------
@@ -94,15 +156,17 @@ class CalibratedGenerator:
         self,
         date_col: str = "date",
         noise: NoiseKind = "auto",
+        noise_scale: float | None = None,
         auto_tune: bool = False,
         n_trials: int = 50,
         val_fraction: float = 0.1,
         strat_freq: str = "M",
         catboost_params: dict[str, Any] | None = None,
-        random_seed: int = 42,
+        random_seed: int | None = None,
     ) -> None:
         self.date_col = date_col
         self.noise = noise
+        self.noise_scale = noise_scale
         self.auto_tune = auto_tune
         self.n_trials = n_trials
         self.val_fraction = val_fraction
@@ -112,7 +176,7 @@ class CalibratedGenerator:
 
         self._model: CalibrationModel | None = None
         self._noise_model: NoiseModel | None = None
-        self._X_fit: pd.DataFrame | None = None
+        self._X_fit: pl.DataFrame | None = None
         self._y_fit: NDArray | None = None
 
     @property
@@ -138,7 +202,7 @@ class CalibratedGenerator:
 
     # ---- fit ----
 
-    def fit(self, X: pd.DataFrame, y: NDArray) -> "CalibratedGenerator":
+    def fit(self, X: pl.DataFrame, y: NDArray) -> "CalibratedGenerator":
         """Fit calibration model and noise distribution.
 
         The model is trained only on the training split (90% by default).
@@ -147,8 +211,8 @@ class CalibratedGenerator:
 
         Parameters
         ----------
-        X : pd.DataFrame
-            Must contain date_col and numeric feature columns.
+        X : pl.DataFrame
+            Must contain date_col (Date or Datetime) and numeric feature columns.
         y : array of shape (n_samples,)
             Target variable.
 
@@ -157,7 +221,7 @@ class CalibratedGenerator:
         self
         """
         y = np.asarray(y, dtype=np.float64)
-        self._X_fit = X.copy()
+        self._X_fit = X
         self._y_fit = y
 
         self._model = CalibrationModel(
@@ -171,10 +235,12 @@ class CalibratedGenerator:
         )
         self._model.fit(X, y)
 
-        # noise from train-set residuals only
         residuals = self._model.residuals(X, y)
         self._noise_model = NoiseModel(kind=self.noise, random_seed=self.random_seed)
         self._noise_model.fit(residuals)
+
+        if self.noise_scale is not None:
+            self._noise_model.set_scale(self.noise_scale)
 
         return self
 
@@ -182,7 +248,7 @@ class CalibratedGenerator:
 
     def generate(
         self,
-        X: pd.DataFrame,
+        X: pl.DataFrame,
         treatment_start: str | None = None,
         treatment: list[tuple[str, str, float]] | None = None,
         tau: float | list[float] | None = None,
@@ -203,7 +269,7 @@ class CalibratedGenerator:
 
         Parameters
         ----------
-        X : pd.DataFrame
+        X : pl.DataFrame
         treatment_start : str or None
         treatment : list of (start_date, end_date, tau) or None
         tau : float or list[float] or None
@@ -216,7 +282,7 @@ class CalibratedGenerator:
         if not self.is_fitted:
             raise RuntimeError("Call .fit() first.")
 
-        dates = pd.to_datetime(X[self.date_col])
+        dates = X[self.date_col]
         f_X = self._model.predict(X)
 
         effect_or_grid = build_treatment_vector(
@@ -226,11 +292,9 @@ class CalibratedGenerator:
             tau=tau,
         )
 
-        # mode B or mode A with single tau: effect_or_grid is NDArray
         if isinstance(effect_or_grid, np.ndarray):
             return self._generate_single(f_X, effect_or_grid, n_simulations)
 
-        # mode A with tau grid: effect_or_grid is dict[float, NDArray]
         return {
             t: self._generate_single(f_X, eff, n_simulations)
             for t, eff in effect_or_grid.items()
@@ -246,12 +310,107 @@ class CalibratedGenerator:
         simulations = base[np.newaxis, :] + eps
         return GenerationResult(simulations=simulations, effect=effect, f_X=f_X)
 
+    # ---- feature noise generation ----
+
+    def generate_with_feature_noise(
+        self,
+        X: pl.DataFrame,
+        feature_noise: dict[str, dict],
+        n_simulations: int = 500,
+    ) -> FeatureNoiseResult:
+        """Generate Y trajectories by injecting user-specified noise into features.
+
+        DGP:  Y_sim = f(X̃) + ε_Y
+              X̃[j] = X[j] + ε_X[j]  for j in feature_noise
+              X̃[j] = X[j]            otherwise
+
+        This is a sensitivity analysis tool — it does not use treatment effects.
+        Use :meth:`generate` for treatment-based simulations.
+
+        Parameters
+        ----------
+        X : pl.DataFrame
+        feature_noise : dict[str, dict]
+            Mapping of feature name → noise spec. Each spec must contain:
+
+            - ``distribution``: ``"normal"`` or ``"t"``
+            - ``scale``: float — std for normal, scale parameter for t
+            - ``loc``: float, optional (default 0)
+            - ``df``: float, required when ``distribution="t"``
+
+        n_simulations : int
+
+        Returns
+        -------
+        FeatureNoiseResult
+
+        Examples
+        --------
+        >>> result = gen.generate_with_feature_noise(
+        ...     X,
+        ...     feature_noise={
+        ...         "USDRUB": {"distribution": "normal", "scale": 0.01},
+        ...         "OIL":    {"distribution": "t", "scale": 0.02, "df": 4},
+        ...     },
+        ...     n_simulations=500,
+        ... )
+        >>> result.simulations.shape
+        (500, n_samples)
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Call .fit() first.")
+
+        feature_cols = [c for c in X.columns if c != self.date_col]
+        for fname in feature_noise:
+            if fname not in feature_cols:
+                raise ValueError(
+                    f"Feature {fname!r} not found in X. "
+                    f"Available features: {feature_cols}."
+                )
+
+        n = len(X)
+        rng = np.random.default_rng(self.random_seed)
+
+        # Sample all feature noises at once: (n_simulations, n_samples) per feature.
+        # scale=0 returns zeros without consuming RNG state, keeping eps_Y reproducible.
+        feat_noise_arrays: dict[str, NDArray] = {
+            fname: _sample_feature_noise(spec, size=(n_simulations, n), rng=rng)
+            for fname, spec in feature_noise.items()
+        }
+
+        # Sample Y noise
+        eps_Y = self._noise_model.sample_rng(size=(n_simulations, n), rng=rng)
+
+        X_np = X.drop(self.date_col).to_numpy().astype(np.float64)
+        feat_idx = {fname: feature_cols.index(fname) for fname in feature_noise}
+
+        f_X_mean = self._model.predict(X_np)
+
+        # Noisy feature values: X̃[j] = X[j] + ε_X[j], shape (n_simulations, n_samples)
+        X_simulations: dict[str, NDArray] = {
+            fname: X_np[:, feat_idx[fname]] + noise_arr
+            for fname, noise_arr in feat_noise_arrays.items()
+        }
+
+        simulations = np.empty((n_simulations, n))
+        for i in range(n_simulations):
+            X_tilde = X_np.copy()
+            for fname, idx in feat_idx.items():
+                X_tilde[:, idx] = X_simulations[fname][i]
+            simulations[i] = self._model.predict(X_tilde) + eps_Y[i]
+
+        return FeatureNoiseResult(
+            simulations=simulations,
+            X_simulations=X_simulations,
+            f_X_mean=f_X_mean,
+        )
+
     # ---- diagnostics ----
 
     def diagnose(
         self,
         result: GenerationResult,
-        X: pd.DataFrame | None = None,
+        X: pl.DataFrame | None = None,
         y_real: NDArray | None = None,
     ) -> DiagnosticReport:
         """Run full diagnostics on a generation result.
@@ -259,7 +418,7 @@ class CalibratedGenerator:
         Parameters
         ----------
         result : GenerationResult
-        X : pd.DataFrame or None (defaults to fit data)
+        X : pl.DataFrame or None (defaults to fit data)
         y_real : array or None (defaults to fit data)
 
         Returns
@@ -272,7 +431,7 @@ class CalibratedGenerator:
             y_real = self._y_fit
         y_real = np.asarray(y_real, dtype=np.float64)
 
-        X_numeric = X.drop(columns=[self.date_col]).values.astype(np.float64)
+        X_numeric = X.drop(self.date_col).to_numpy().astype(np.float64)
         synth_mean = result.simulations.mean(axis=0)
 
         ks_res = ks_test(y_real, synth_mean)
@@ -301,7 +460,7 @@ class CalibratedGenerator:
     def plot_correlations(
         self,
         result: GenerationResult,
-        X: pd.DataFrame | None = None,
+        X: pl.DataFrame | None = None,
         y_real: NDArray | None = None,
         feature_names: list[str] | None = None,
     ):
@@ -311,7 +470,7 @@ class CalibratedGenerator:
         if y_real is None:
             y_real = self._y_fit
         y_real = np.asarray(y_real, dtype=np.float64)
-        X_numeric = X.drop(columns=[self.date_col]).values.astype(np.float64)
+        X_numeric = X.drop(self.date_col).to_numpy().astype(np.float64)
         synth_mean = result.simulations.mean(axis=0)
         diags = feature_correlations(X_numeric, y_real, synth_mean)
         return plot_correlation_comparison(diags, feature_names=feature_names)
