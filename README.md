@@ -11,6 +11,7 @@ Y = effect(t) + f(X) + ε
 where:
 - **f(X)** — CatBoost model trained on real features, capturing nonlinear structure
 - **effect(t)** — date-based treatment effect (single start date or arbitrary windows with different τ)
+- **τ** — user-defined effect size added to the target trajectory during the treatment period
 - **ε** — noise sampled from a distribution fitted to calibration residuals
 
 ## Installation
@@ -31,8 +32,11 @@ pip install "calsyn[tune]"
 import polars as pl
 from calsyn import CalibratedGenerator
 
-# X is a Polars DataFrame with a date column and numeric features
-# y is the target variable (e.g. log-returns)
+# df is the source Polars DataFrame with date, feature columns, and target column.
+# Split it into X (date + features) and y (target) before fitting.
+target_col = "SBER"
+X = df.drop(target_col)
+y = df[target_col].to_numpy()
 
 gen = CalibratedGenerator(date_col="date", noise="auto")
 gen.fit(X, y)
@@ -44,25 +48,65 @@ result.simulations.shape  # (500, n_samples)
 
 ## Input Format
 
-`X` must be a `pl.DataFrame` with:
+The library expects the input data as:
+
+- `df` — source `pl.DataFrame` with one date/datetime column, numeric feature columns,
+  and one target column
+- `X` — model input: `df` without the target column
+- `y` — target array extracted from `df[target_col]`
+
+`X` must contain:
+
 - a date/datetime column (name passed via `date_col`)
-- numeric feature columns
+- numeric feature columns used to predict the target
+
+`X` must not contain the target column. The order of rows in `X` and `y` must match:
+`y[i]` is the target value for row `X[i]`. The date column is used for treatment
+windows and stratified validation; all other columns in `X` are passed to CatBoost
+as numeric features.
 
 ```python
 from datetime import date, timedelta
 import polars as pl
 
 start = date(2023, 1, 1)
-X = pl.DataFrame({
+df = pl.DataFrame({
     "date": [start + timedelta(days=i) for i in range(500)],
     "GAZP": gazp_log_returns,
     "LKOH": lkoh_log_returns,
     "USDRUB": usdrub_log_returns,
+    "SBER": sber_log_returns,
 })
-y = sber_log_returns  # target (numpy array)
+
+target_col = "SBER"
+X = df.drop(target_col)
+y = df[target_col].to_numpy()
+
+gen = CalibratedGenerator(date_col="date", noise="auto")
+gen.fit(X, y)
+```
+
+Equivalent shape requirements:
+
+```python
+assert len(X) == len(y)
+assert "date" in X.columns
+assert target_col not in X.columns
 ```
 
 ## Treatment Modes
+
+`tau` (Greek letter `τ`) is the treatment effect size that you set manually for
+the target variable. It is not estimated by the model; it is added directly to
+the generated target value for dates where treatment is active:
+
+```
+Y_sim(t) = f(X_t) + tau + ε_t
+```
+
+For example, if the target is log-returns, `tau=0.02` means an additive shock of
+`0.02` to the simulated log-return on treated dates. `tau=0.0` is the no-effect
+baseline, and negative values model a negative shock.
 
 ### Mode A — single start date
 
