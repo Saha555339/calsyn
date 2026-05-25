@@ -48,3 +48,6 @@ coverage.xml
 
 # Logs
 *.log
+
+# AutoDeck Diagrams
+*.mmd
